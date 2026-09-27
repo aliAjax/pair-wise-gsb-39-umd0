@@ -1,4 +1,4 @@
-"""Transit disruption planning and atomic publication service."""
+"""Transit disruption planning, transfer-guarantee and atomic publication service."""
 from __future__ import annotations
 
 import argparse
@@ -40,6 +40,106 @@ def _within_window(value: int, start: int | None, end: int | None) -> bool:
     if start is None or end is None:
         return False
     return start <= value <= end
+
+
+# --- Transfer guarantee computation (pure functions, no database access) ---
+
+def adjusted_cumulative(rows: list[Any], changes: list[Any], reverse: bool = False) -> list[tuple[int, int]]:
+    """Cumulative minutes from the first served stop of one line.
+
+    Closed or skipped stops drop out while their segment time accumulates onto
+    the next served stop (the same rule the routing graph uses).  Detours relax
+    the cumulative forward: when riding a detour would arrive later, that stop
+    and everything after it shift by the difference, so guarantee judgments
+    stay conservative.  With ``reverse=True`` the cumulative runs from the last
+    stop backwards, matching direction-1 trips.
+    """
+    closed = {int(c["stop_id"]) for c in changes
+              if c["kind"] in {"stop_closure", "skip_stop"} and c["stop_id"] is not None}
+    usable = [row for row in rows if int(row["stop_id"]) not in closed]
+    if reverse:
+        usable = list(reversed(usable))
+    arrivals: list[list[Any]] = []
+    total = 0
+    previous_sequence: int | None = None
+    for row in usable:
+        sequence = int(row["sequence"])
+        if previous_sequence is not None:
+            low, high = sorted((previous_sequence, sequence))
+            total += sum(int(r["travel_minutes_from_previous"])
+                         for r in rows if low < int(r["sequence"]) <= high)
+        arrivals.append([int(row["stop_id"]), total])
+        previous_sequence = sequence
+    positions = {stop_id: index for index, (stop_id, _) in enumerate(arrivals)}
+    detours = [c for c in changes if c["kind"] == "detour"
+               and c["from_stop_id"] is not None and c["to_stop_id"] is not None
+               and c["travel_minutes"] is not None]
+    for index in range(len(arrivals)):
+        stop_id = arrivals[index][0]
+        for change in detours:
+            source = int(change["from_stop_id"])
+            if int(change["to_stop_id"]) != stop_id or source not in positions or positions[source] >= index:
+                continue
+            candidate = arrivals[positions[source]][1] + int(change["travel_minutes"])
+            if candidate > arrivals[index][1]:
+                delay = candidate - arrivals[index][1]
+                for rest in range(index, len(arrivals)):
+                    arrivals[rest][1] += delay
+    return [(stop_id, minutes) for stop_id, minutes in arrivals]
+
+
+def trip_arrival_at_stop(rows: list[Any], changes: list[Any], trip: Any, stop_id: int) -> int | None:
+    """Arrival minute of one trip at a stop, or None when the stop is not served."""
+    cumulative = adjusted_cumulative(rows, changes, reverse=int(trip["direction"]) == 1)
+    for candidate, minutes in cumulative:
+        if candidate == stop_id:
+            return int(trip["departure_minute"]) + minutes
+    return None
+
+
+def judge_transfer(arrival_minute: int | None, walk_minutes: int, min_retained_minutes: int,
+                   departures: list[int]) -> dict[str, Any]:
+    """Evaluate one transfer guarantee against feeder departures (service-day minutes).
+
+    The retained time is measured between the moment the passenger could board
+    (arrival + walk) and the latest feeder departure they can still catch.  The
+    guarantee is marked ``pending_adjustment`` whenever that buffer is shorter
+    than the required minimum, and ``shortfall_minutes`` reports by how much.
+    """
+    judgment: dict[str, Any] = {
+        "status": "pending_adjustment",
+        "arrival_minute": arrival_minute,
+        "arrival": format_service_time(arrival_minute) if arrival_minute is not None else None,
+        "ready_minute": None,
+        "last_departure": departures[-1] if departures else None,
+        "latest_catchable_departure": None,
+        "latest_catchable": None,
+        "retained_minutes": None,
+        "shortfall_minutes": min_retained_minutes,
+    }
+    if arrival_minute is None:
+        judgment["reason"] = "no_incoming_service"
+        return judgment
+    ready = arrival_minute + walk_minutes
+    judgment["ready_minute"] = ready
+    if not departures:
+        judgment["reason"] = "no_feeder_service"
+        return judgment
+    catchable = [minute for minute in departures if minute >= ready]
+    if not catchable:
+        retained = departures[-1] - ready
+        judgment.update(reason="no_catchable_trip", retained_minutes=retained,
+                        shortfall_minutes=min_retained_minutes - retained)
+        return judgment
+    latest = catchable[-1]
+    retained = latest - ready
+    judgment.update(latest_catchable_departure=latest, latest_catchable=format_service_time(latest),
+                    retained_minutes=retained)
+    if retained >= min_retained_minutes:
+        judgment.update(status="ok", reason="ok", shortfall_minutes=0)
+    else:
+        judgment.update(reason="insufficient_retained", shortfall_minutes=min_retained_minutes - retained)
+    return judgment
 
 
 class DomainError(Exception):
@@ -130,6 +230,16 @@ class Database:
                     effective_end_minute INTEGER,
                     accessible INTEGER,
                     payload TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS transfer_guarantees (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+                    transfer_stop_id INTEGER NOT NULL REFERENCES stops(id),
+                    feeder_line_id INTEGER NOT NULL REFERENCES lines(id),
+                    walk_minutes INTEGER NOT NULL CHECK(walk_minutes >= 0),
+                    min_retained_minutes INTEGER NOT NULL CHECK(min_retained_minutes >= 0),
+                    created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS import_errors (
@@ -291,6 +401,12 @@ class Database:
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (new_id, change["kind"], change["line_id"], change["stop_id"], change["from_stop_id"], change["to_stop_id"], change["travel_minutes"], change["effective_start_minute"], change["effective_end_minute"], change["accessible"], change["payload"], utcnow()),
                 )
+            for guarantee in conn.execute("SELECT * FROM transfer_guarantees WHERE version_id=?", (parent_id,)):
+                conn.execute(
+                    """INSERT INTO transfer_guarantees(version_id,transfer_stop_id,feeder_line_id,walk_minutes,min_retained_minutes,created_by,created_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (new_id, guarantee["transfer_stop_id"], guarantee["feeder_line_id"], guarantee["walk_minutes"], guarantee["min_retained_minutes"], actor, utcnow()),
+                )
             self._audit(conn, actor, "version.copied", "version", new_id, {"parent_id": parent_id})
             return dict(conn.execute("SELECT * FROM versions WHERE id=?", (new_id,)).fetchone())
 
@@ -346,6 +462,40 @@ class Database:
             self._audit(conn, actor, "change.added", "version", version_id, {"kind": kind, "change_id": cur.lastrowid})
             return dict(conn.execute("SELECT * FROM changes WHERE id=?", (cur.lastrowid,)).fetchone())
 
+    def add_guarantee(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        if role not in {"planner", "editor", "admin"}:
+            raise DomainError("没有登记换乘保障的权限", 403)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            version = conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone()
+            if not version:
+                raise DomainError("方案版本不存在", 404)
+            if version["status"] != "draft":
+                raise DomainError("只有草稿版本可以登记换乘保障", 409)
+            try:
+                transfer_stop_id = int(payload.get("transfer_stop_id"))
+                feeder_line_id = int(payload.get("feeder_line_id"))
+                walk_minutes = int(payload.get("walk_minutes"))
+                min_retained = int(payload.get("min_retained_minutes"))
+            except (TypeError, ValueError):
+                raise DomainError("换乘保障需要换乘站、接驳线路、步行分钟和最少留乘分钟")
+            if walk_minutes < 0 or min_retained < 0:
+                raise DomainError("步行分钟和最少留乘分钟不能为负")
+            if not conn.execute("SELECT 1 FROM stops WHERE id=?", (transfer_stop_id,)).fetchone():
+                raise DomainError("换乘站不存在", 404)
+            if not conn.execute("SELECT 1 FROM lines WHERE id=?", (feeder_line_id,)).fetchone():
+                raise DomainError("接驳线路不存在", 404)
+            if not conn.execute("SELECT 1 FROM line_stops WHERE line_id=? AND stop_id=?", (feeder_line_id, transfer_stop_id)).fetchone():
+                raise DomainError("接驳线路不经停换乘站")
+            cur = conn.execute(
+                """INSERT INTO transfer_guarantees(version_id,transfer_stop_id,feeder_line_id,walk_minutes,min_retained_minutes,created_by,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (version_id, transfer_stop_id, feeder_line_id, walk_minutes, min_retained, actor, utcnow()),
+            )
+            conn.execute("UPDATE versions SET updated_at=? WHERE id=?", (utcnow(), version_id))
+            self._audit(conn, actor, "guarantee.added", "version", version_id, {"guarantee_id": cur.lastrowid})
+            return dict(conn.execute("SELECT * FROM transfer_guarantees WHERE id=?", (cur.lastrowid,)).fetchone())
+
     def transition(self, version_id: int, actor: str, role: str, action: str) -> dict[str, Any]:
         if role not in {"planner", "editor", "reviewer", "admin"}:
             raise DomainError("没有状态流转权限", 403)
@@ -375,7 +525,9 @@ class Database:
                 if status != "approved" or role not in {"reviewer", "admin"}:
                     raise DomainError("只有已批准版本可以发布", 409)
                 changes = [dict(r) for r in conn.execute("SELECT kind,line_id,stop_id,from_stop_id,to_stop_id,travel_minutes,effective_start_minute,effective_end_minute,accessible,payload FROM changes WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
-                snapshot = {"version_id": version_id, "disruption_id": version["disruption_id"], "version_no": version["version_no"], "changes": changes, "base_hash": self._base_hash(conn)}
+                guarantees = [dict(r) for r in conn.execute("SELECT * FROM transfer_guarantees WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
+                evaluated = [{**guarantee, "judgment": self._judge_guarantee(conn, guarantee, changes)} for guarantee in guarantees]
+                snapshot = {"version_id": version_id, "disruption_id": version["disruption_id"], "version_no": version["version_no"], "changes": changes, "transfer_guarantees": evaluated, "base_hash": self._base_hash(conn)}
                 snapshot_text = canonical(snapshot)
                 digest = hashlib.sha256(snapshot_text.encode()).hexdigest()
                 conn.execute("UPDATE versions SET status='published',snapshot_hash=?,snapshot=?,published_at=?,updated_at=? WHERE id=?", (digest, snapshot_text, utcnow(), utcnow(), version_id))
@@ -444,6 +596,73 @@ class Database:
                 graph[dst].append((src, minutes, {"line_id": change["line_id"], "kind": "detour", "change_id": change["id"]}))
             return graph, stops
 
+    def _feeder_departures(self, conn: sqlite3.Connection, line_id: int, stop_id: int,
+                           changes: list[Any]) -> list[int]:
+        """Sorted departure minutes of the feeder line at the transfer stop.
+
+        Each trip is timed against the version changes active at its own
+        departure minute, so a retimed feeder is judged by its adjusted times.
+        """
+        rows = conn.execute("SELECT * FROM line_stops WHERE line_id=? ORDER BY sequence", (line_id,)).fetchall()
+        departures: list[int] = []
+        for trip in conn.execute("SELECT * FROM trips WHERE line_id=?", (line_id,)):
+            active = [c for c in changes if _within_window(int(trip["departure_minute"]), c["effective_start_minute"], c["effective_end_minute"])]
+            arrival = trip_arrival_at_stop(rows, active, trip, stop_id)
+            if arrival is not None:
+                departures.append(arrival)
+        return sorted(departures)
+
+    def _last_arrival_at_stop(self, conn: sqlite3.Connection, stop_id: int, changes: list[Any],
+                              exclude_line_id: int | None = None) -> int | None:
+        """Latest trip arrival at the stop across serving lines under the version.
+
+        The feeder line itself is excluded: passengers already riding it do not
+        need the transfer guarantee.  Used as the publish-time reference arrival.
+        """
+        best: int | None = None
+        line_ids = [int(row["line_id"]) for row in conn.execute("SELECT DISTINCT line_id FROM line_stops WHERE stop_id=?", (stop_id,))]
+        for line_id in line_ids:
+            if exclude_line_id is not None and line_id == exclude_line_id:
+                continue
+            rows = conn.execute("SELECT * FROM line_stops WHERE line_id=? ORDER BY sequence", (line_id,)).fetchall()
+            for trip in conn.execute("SELECT * FROM trips WHERE line_id=?", (line_id,)):
+                active = [c for c in changes if _within_window(int(trip["departure_minute"]), c["effective_start_minute"], c["effective_end_minute"])]
+                arrival = trip_arrival_at_stop(rows, active, trip, stop_id)
+                if arrival is not None and (best is None or arrival > best):
+                    best = arrival
+        return best
+
+    def _judge_guarantee(self, conn: sqlite3.Connection, guarantee: Any, changes: list[Any]) -> dict[str, Any]:
+        stop_id = int(guarantee["transfer_stop_id"])
+        feeder_line_id = int(guarantee["feeder_line_id"])
+        arrival = self._last_arrival_at_stop(conn, stop_id, changes, exclude_line_id=feeder_line_id)
+        departures = self._feeder_departures(conn, feeder_line_id, stop_id, changes)
+        return judge_transfer(arrival, int(guarantee["walk_minutes"]), int(guarantee["min_retained_minutes"]), departures)
+
+    def _evaluate_guarantees_on_path(self, version_id: int, path: list[int],
+                                     legs: list[dict[str, Any]], at_minute: int) -> list[dict[str, Any]]:
+        """Judge each registered guarantee whose transfer stop lies on the path."""
+        with self.connect() as conn:
+            guarantees = [dict(r) for r in conn.execute("SELECT * FROM transfer_guarantees WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
+            if not guarantees:
+                return []
+            changes = [dict(r) for r in conn.execute("SELECT * FROM changes WHERE version_id=?", (version_id,)).fetchall()]
+            offsets = {int(path[0]): 0}
+            total = 0
+            for index, leg in enumerate(legs):
+                total += int(leg["minutes"])
+                offsets.setdefault(int(path[index + 1]), total)
+            evaluations = []
+            for guarantee in guarantees:
+                stop_id = int(guarantee["transfer_stop_id"])
+                if stop_id not in offsets:
+                    continue
+                departures = self._feeder_departures(conn, int(guarantee["feeder_line_id"]), stop_id, changes)
+                judgment = judge_transfer(at_minute + offsets[stop_id], int(guarantee["walk_minutes"]),
+                                          int(guarantee["min_retained_minutes"]), departures)
+                evaluations.append({**guarantee, "judgment": judgment})
+            return evaluations
+
     def route(self, from_stop_id: int, to_stop_id: int, version_id: int | None = None,
               at_minute: int = 0, require_accessible: bool = False) -> dict[str, Any]:
         if from_stop_id == to_stop_id:
@@ -480,8 +699,11 @@ class Database:
             cursor = previous
         path.reverse()
         legs.reverse()
-        return {"from_stop_id": from_stop_id, "to_stop_id": to_stop_id, "minutes": distance[to_stop_id], "path": path,
-                "legs": legs, "status": "ok", "arrival": format_service_time(at_minute + distance[to_stop_id])}
+        result = {"from_stop_id": from_stop_id, "to_stop_id": to_stop_id, "minutes": distance[to_stop_id], "path": path,
+                  "legs": legs, "status": "ok", "arrival": format_service_time(at_minute + distance[to_stop_id])}
+        if version_id is not None:
+            result["transfer_guarantees"] = self._evaluate_guarantees_on_path(version_id, path, legs, at_minute)
+        return result
 
     def trip_times(self, trip_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -535,6 +757,14 @@ class Database:
             result["changes"] = changes
             if result["snapshot"]:
                 result["snapshot"] = json.loads(result["snapshot"])
+                # Published versions keep the conclusions frozen at publish time.
+                result["transfer_guarantees"] = result["snapshot"].get("transfer_guarantees", [])
+            else:
+                guarantees = [dict(r) for r in conn.execute("SELECT * FROM transfer_guarantees WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
+                result["transfer_guarantees"] = [
+                    {**guarantee, "judgment": self._judge_guarantee(conn, guarantee, changes)}
+                    for guarantee in guarantees
+                ]
             return result
 
     def list_import_errors(self) -> list[dict[str, Any]]:
@@ -569,7 +799,10 @@ def seed_demo(db: Database) -> dict[str, int]:
             {"line_code": "L2", "stop_code": "X1", "sequence": 1, "travel_minutes_from_previous": 8},
             {"line_code": "L2", "stop_code": "S4", "sequence": 2, "travel_minutes_from_previous": 9},
         ],
-        "trips": [{"line_code": "L1", "service_code": "daily", "direction": 0, "departure_minute": 1430}],
+        "trips": [
+            {"line_code": "L1", "service_code": "daily", "direction": 0, "departure_minute": 1430},
+            {"line_code": "L2", "service_code": "daily", "direction": 0, "departure_minute": 1440},
+        ],
     }
     result = db.import_base("planner-01", data, "planner")
     if not result["accepted"]:
@@ -657,6 +890,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.add_change(int(body.get("version_id")), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "changes":
                 return self._send(self.db.add_change(int(parts[2]), actor, body, role), 201)
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "guarantees":
+                return self._send(self.db.add_guarantee(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] in {"submit", "approve", "reject", "publish"}:
                 return self._send(self.db.transition(int(parts[2]), actor, role, parts[3]))
             raise DomainError("接口不存在", 404)
