@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import transfer_guarantee as tg
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "transit_disruption.db"
 
@@ -130,6 +132,15 @@ class Database:
                     effective_end_minute INTEGER,
                     accessible INTEGER,
                     payload TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS transfer_guarantees (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+                    transfer_stop_id INTEGER NOT NULL REFERENCES stops(id),
+                    feeder_line_id INTEGER NOT NULL REFERENCES lines(id),
+                    walk_minutes INTEGER NOT NULL CHECK(walk_minutes >= 0),
+                    min_buffer_minutes INTEGER NOT NULL CHECK(min_buffer_minutes >= 0),
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS import_errors (
@@ -291,6 +302,11 @@ class Database:
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (new_id, change["kind"], change["line_id"], change["stop_id"], change["from_stop_id"], change["to_stop_id"], change["travel_minutes"], change["effective_start_minute"], change["effective_end_minute"], change["accessible"], change["payload"], utcnow()),
                 )
+            for guarantee in conn.execute("SELECT * FROM transfer_guarantees WHERE version_id=?", (parent_id,)):
+                conn.execute(
+                    "INSERT INTO transfer_guarantees(version_id,transfer_stop_id,feeder_line_id,walk_minutes,min_buffer_minutes,created_at) VALUES(?,?,?,?,?,?)",
+                    (new_id, guarantee["transfer_stop_id"], guarantee["feeder_line_id"], guarantee["walk_minutes"], guarantee["min_buffer_minutes"], utcnow()),
+                )
             self._audit(conn, actor, "version.copied", "version", new_id, {"parent_id": parent_id})
             return dict(conn.execute("SELECT * FROM versions WHERE id=?", (new_id,)).fetchone())
 
@@ -346,6 +362,41 @@ class Database:
             self._audit(conn, actor, "change.added", "version", version_id, {"kind": kind, "change_id": cur.lastrowid})
             return dict(conn.execute("SELECT * FROM changes WHERE id=?", (cur.lastrowid,)).fetchone())
 
+    def add_transfer_guarantee(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        if role not in {"planner", "editor", "admin"}:
+            raise DomainError("没有登记换乘保障的权限", 403)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            version = conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone()
+            if not version:
+                raise DomainError("方案版本不存在", 404)
+            if version["status"] != "draft":
+                raise DomainError("只有草稿版本可以登记换乘保障", 409)
+            transfer_stop_id = payload.get("transfer_stop_id")
+            feeder_line_id = payload.get("feeder_line_id")
+            if transfer_stop_id is None or feeder_line_id is None:
+                raise DomainError("换乘保障需要换乘站和接驳线路")
+            if not conn.execute("SELECT 1 FROM stops WHERE id=?", (int(transfer_stop_id),)).fetchone():
+                raise DomainError("换乘站不存在", 404)
+            if not conn.execute("SELECT 1 FROM lines WHERE id=?", (int(feeder_line_id),)).fetchone():
+                raise DomainError("接驳线路不存在", 404)
+            if not conn.execute("SELECT 1 FROM line_stops WHERE line_id=? AND stop_id=?", (int(feeder_line_id), int(transfer_stop_id))).fetchone():
+                raise DomainError("接驳线路不经过换乘站")
+            try:
+                walk = int(payload.get("walk_minutes"))
+                buffer = int(payload.get("min_buffer_minutes"))
+            except (TypeError, ValueError):
+                raise DomainError("步行分钟和最少留乘分钟必须是非负整数")
+            if walk < 0 or buffer < 0:
+                raise DomainError("步行分钟和最少留乘分钟必须是非负整数")
+            cur = conn.execute(
+                "INSERT INTO transfer_guarantees(version_id,transfer_stop_id,feeder_line_id,walk_minutes,min_buffer_minutes,created_at) VALUES(?,?,?,?,?,?)",
+                (version_id, int(transfer_stop_id), int(feeder_line_id), walk, buffer, utcnow()),
+            )
+            conn.execute("UPDATE versions SET updated_at=? WHERE id=?", (utcnow(), version_id))
+            self._audit(conn, actor, "guarantee.added", "version", version_id, {"guarantee_id": cur.lastrowid})
+            return dict(conn.execute("SELECT * FROM transfer_guarantees WHERE id=?", (cur.lastrowid,)).fetchone())
+
     def transition(self, version_id: int, actor: str, role: str, action: str) -> dict[str, Any]:
         if role not in {"planner", "editor", "reviewer", "admin"}:
             raise DomainError("没有状态流转权限", 403)
@@ -375,7 +426,8 @@ class Database:
                 if status != "approved" or role not in {"reviewer", "admin"}:
                     raise DomainError("只有已批准版本可以发布", 409)
                 changes = [dict(r) for r in conn.execute("SELECT kind,line_id,stop_id,from_stop_id,to_stop_id,travel_minutes,effective_start_minute,effective_end_minute,accessible,payload FROM changes WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
-                snapshot = {"version_id": version_id, "disruption_id": version["disruption_id"], "version_no": version["version_no"], "changes": changes, "base_hash": self._base_hash(conn)}
+                guarantees = self._guarantees_with_judgments(conn, version_id)
+                snapshot = {"version_id": version_id, "disruption_id": version["disruption_id"], "version_no": version["version_no"], "changes": changes, "transfer_guarantees": guarantees, "base_hash": self._base_hash(conn)}
                 snapshot_text = canonical(snapshot)
                 digest = hashlib.sha256(snapshot_text.encode()).hexdigest()
                 conn.execute("UPDATE versions SET status='published',snapshot_hash=?,snapshot=?,published_at=?,updated_at=? WHERE id=?", (digest, snapshot_text, utcnow(), utcnow(), version_id))
@@ -390,6 +442,70 @@ class Database:
         memberships = [dict(r) for r in conn.execute("SELECT * FROM line_stops ORDER BY line_id,sequence")]
         trips = [dict(r) for r in conn.execute("SELECT * FROM trips ORDER BY id")]
         return hashlib.sha256(canonical({"lines": lines, "stops": stops, "line_stops": memberships, "trips": trips}).encode()).hexdigest()
+
+    def _line_spec(self, conn: sqlite3.Connection, line_id: int) -> dict[str, Any]:
+        rows = [dict(r) for r in conn.execute("SELECT stop_id,travel_minutes_from_previous FROM line_stops WHERE line_id=? ORDER BY sequence", (line_id,))]
+        trips = [dict(r) for r in conn.execute("SELECT departure_minute,direction FROM trips WHERE line_id=? ORDER BY id", (line_id,))]
+        return {"rows": rows, "trips": trips}
+
+    def _feeder_departures(self, conn: sqlite3.Connection, guarantee: dict[str, Any]) -> list[int]:
+        spec = self._line_spec(conn, int(guarantee["feeder_line_id"]))
+        return tg.departures_at_stop(spec["rows"], spec["trips"], int(guarantee["transfer_stop_id"]))
+
+    def _reference_arrival(self, conn: sqlite3.Connection, guarantee: dict[str, Any]) -> int | None:
+        # Version-level judgments use the last scheduled arrival at the
+        # transfer stop (excluding the feeder line itself) as the estimated
+        # arrival, matching the night last-bus connection scenario.
+        specs = [
+            self._line_spec(conn, int(row["line_id"]))
+            for row in conn.execute("SELECT DISTINCT line_id FROM line_stops WHERE stop_id=? AND line_id<>?", (int(guarantee["transfer_stop_id"]), int(guarantee["feeder_line_id"])))
+        ]
+        return tg.last_arrival_at_stop(specs, int(guarantee["transfer_stop_id"]))
+
+    @staticmethod
+    def _format_judgment(judgment: dict[str, Any]) -> dict[str, Any]:
+        formatted = dict(judgment)
+        clocks: dict[str, str] = {}
+        for key, label in (("arrival_minute", "arrival"), ("ready_minute", "ready"),
+                           ("latest_catchable_departure", "latest_catchable"), ("last_departure", "last_departure")):
+            value = judgment.get(key)
+            if value is not None:
+                t = format_service_time(int(value))
+                clocks[label] = t["clock"] if t["day_offset"] == 0 else f"{t['clock']}+{t['day_offset']}"
+        formatted["clocks"] = clocks
+        return formatted
+
+    def _guarantee_rows(self, conn: sqlite3.Connection, version_id: int) -> list[dict[str, Any]]:
+        return [dict(r) for r in conn.execute("SELECT * FROM transfer_guarantees WHERE version_id=? ORDER BY id", (version_id,))]
+
+    def _guarantees_with_judgments(self, conn: sqlite3.Connection, version_id: int) -> list[dict[str, Any]]:
+        items = []
+        for guarantee in self._guarantee_rows(conn, version_id):
+            judgment = tg.judge_guarantee(
+                arrival_minute=self._reference_arrival(conn, guarantee),
+                walk_minutes=int(guarantee["walk_minutes"]),
+                min_buffer_minutes=int(guarantee["min_buffer_minutes"]),
+                departures=self._feeder_departures(conn, guarantee),
+            )
+            items.append({**guarantee, "judgment": self._format_judgment(judgment)})
+        return items
+
+    def _version_guarantees(self, conn: sqlite3.Connection, version: sqlite3.Row) -> list[dict[str, Any]]:
+        # Published versions show the judgments frozen into their snapshot;
+        # drafts and other unpublished versions recompute against the current
+        # base timetable, so base schedule changes only affect new versions.
+        if version["status"] == "published" and version["snapshot"]:
+            snapshot = json.loads(version["snapshot"])
+            if "transfer_guarantees" in snapshot:
+                return snapshot["transfer_guarantees"]
+        return self._guarantees_with_judgments(conn, int(version["id"]))
+
+    def list_transfer_guarantees(self, version_id: int) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            version = conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone()
+            if not version:
+                raise DomainError("方案版本不存在", 404)
+            return self._version_guarantees(conn, version)
 
     def _graph(self, version_id: int | None, at_minute: int, require_accessible: bool) -> tuple[dict[int, list[tuple[int, int, dict[str, Any]]]], dict[int, sqlite3.Row]]:
         with self.connect() as conn:
@@ -446,8 +562,15 @@ class Database:
 
     def route(self, from_stop_id: int, to_stop_id: int, version_id: int | None = None,
               at_minute: int = 0, require_accessible: bool = False) -> dict[str, Any]:
+        result = self._route_core(from_stop_id, to_stop_id, version_id, at_minute, require_accessible)
+        result["transfer_guarantees"] = self._route_guarantee_judgments(version_id, from_stop_id, at_minute, require_accessible, result)
+        return result
+
+    def _route_core(self, from_stop_id: int, to_stop_id: int, version_id: int | None = None,
+                    at_minute: int = 0, require_accessible: bool = False) -> dict[str, Any]:
         if from_stop_id == to_stop_id:
-            return {"from_stop_id": from_stop_id, "to_stop_id": to_stop_id, "minutes": 0, "path": [from_stop_id], "legs": []}
+            return {"from_stop_id": from_stop_id, "to_stop_id": to_stop_id, "minutes": 0, "path": [from_stop_id],
+                    "legs": [], "status": "ok", "arrival": format_service_time(at_minute)}
         graph, stops = self._graph(version_id, at_minute, require_accessible)
         if from_stop_id not in stops or to_stop_id not in stops:
             raise DomainError("起讫站点不存在", 404)
@@ -482,6 +605,44 @@ class Database:
         legs.reverse()
         return {"from_stop_id": from_stop_id, "to_stop_id": to_stop_id, "minutes": distance[to_stop_id], "path": path,
                 "legs": legs, "status": "ok", "arrival": format_service_time(at_minute + distance[to_stop_id])}
+
+    def _route_guarantee_judgments(self, version_id: int | None, from_stop_id: int, at_minute: int,
+                                   require_accessible: bool, main: dict[str, Any]) -> list[dict[str, Any]]:
+        if version_id is None:
+            return []
+        with self.connect() as conn:
+            items = []
+            for guarantee in self._guarantee_rows(conn, version_id):
+                transfer_stop = int(guarantee["transfer_stop_id"])
+                arrival = self._arrival_on_path(main, transfer_stop, at_minute)
+                if arrival is None:
+                    sub = self._route_core(from_stop_id, transfer_stop, version_id, at_minute, require_accessible)
+                    arrival = None if sub["minutes"] is None else at_minute + int(sub["minutes"])
+                if arrival is None:
+                    judgment = tg.empty_judgment(tg.UNREACHABLE)
+                else:
+                    judgment = tg.judge_guarantee(
+                        arrival_minute=arrival,
+                        walk_minutes=int(guarantee["walk_minutes"]),
+                        min_buffer_minutes=int(guarantee["min_buffer_minutes"]),
+                        departures=self._feeder_departures(conn, guarantee),
+                    )
+                items.append({**guarantee, "judgment": self._format_judgment(judgment)})
+            return items
+
+    @staticmethod
+    def _arrival_on_path(route_result: dict[str, Any], stop_id: int, at_minute: int) -> int | None:
+        path = route_result.get("path") or []
+        if stop_id not in path:
+            return None
+        if path[0] == stop_id:
+            return at_minute
+        elapsed = 0
+        for leg in route_result.get("legs", []):
+            elapsed += int(leg["minutes"])
+            if int(leg["to_stop_id"]) == stop_id:
+                return at_minute + elapsed
+        return None
 
     def trip_times(self, trip_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -535,6 +696,7 @@ class Database:
             result["changes"] = changes
             if result["snapshot"]:
                 result["snapshot"] = json.loads(result["snapshot"])
+            result["transfer_guarantees"] = self._version_guarantees(conn, version)
             return result
 
     def list_import_errors(self) -> list[dict[str, Any]]:
@@ -550,7 +712,7 @@ def seed_demo(db: Database) -> dict[str, int]:
     if db.list_lines():
         return {"line": int(db.list_lines()[0]["id"])}
     data = {
-        "lines": [{"code": "L1", "name": "滨江线"}, {"code": "L2", "name": "环路快线"}],
+        "lines": [{"code": "L1", "name": "滨江线"}, {"code": "L2", "name": "环路快线"}, {"code": "L3", "name": "夜班接驳线"}],
         "stops": [
             {"code": "S1", "name": "北站", "latitude": 31.0, "longitude": 121.0, "accessible": True},
             {"code": "S2", "name": "人民广场", "latitude": 31.01, "longitude": 121.01, "accessible": True},
@@ -558,6 +720,7 @@ def seed_demo(db: Database) -> dict[str, int]:
             {"code": "S4", "name": "码头", "latitude": 31.03, "longitude": 121.03, "accessible": True},
             {"code": "S5", "name": "机场", "latitude": 31.04, "longitude": 121.04, "accessible": True},
             {"code": "X1", "name": "会展中心", "latitude": 31.015, "longitude": 121.025, "accessible": True},
+            {"code": "S6", "name": "夜班枢纽", "latitude": 31.05, "longitude": 121.05, "accessible": True},
         ],
         "line_stops": [
             {"line_code": "L1", "stop_code": "S1", "sequence": 0, "travel_minutes_from_previous": 0},
@@ -568,8 +731,14 @@ def seed_demo(db: Database) -> dict[str, int]:
             {"line_code": "L2", "stop_code": "S1", "sequence": 0, "travel_minutes_from_previous": 0},
             {"line_code": "L2", "stop_code": "X1", "sequence": 1, "travel_minutes_from_previous": 8},
             {"line_code": "L2", "stop_code": "S4", "sequence": 2, "travel_minutes_from_previous": 9},
+            {"line_code": "L3", "stop_code": "S4", "sequence": 0, "travel_minutes_from_previous": 0},
+            {"line_code": "L3", "stop_code": "S6", "sequence": 1, "travel_minutes_from_previous": 12},
         ],
-        "trips": [{"line_code": "L1", "service_code": "daily", "direction": 0, "departure_minute": 1430}],
+        "trips": [
+            {"line_code": "L1", "service_code": "daily", "direction": 0, "departure_minute": 1430},
+            {"line_code": "L3", "service_code": "night", "direction": 0, "departure_minute": 1460},
+            {"line_code": "L3", "service_code": "night", "direction": 0, "departure_minute": 1480},
+        ],
     }
     result = db.import_base("planner-01", data, "planner")
     if not result["accepted"]:
@@ -630,6 +799,8 @@ class Handler(BaseHTTPRequestHandler):
             parts = [p for p in parsed.path.split("/") if p]
             if len(parts) == 3 and parts[:2] == ["api", "versions"]:
                 return self._send(self.db.get_version(int(parts[2])))
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "guarantees":
+                return self._send({"items": self.db.list_transfer_guarantees(int(parts[2]))})
             if len(parts) == 3 and parts[:2] == ["api", "trips"]:
                 return self._send({"times": self.db.trip_times(int(parts[2]))})
             if parsed.path == "/api/route":
@@ -657,6 +828,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.add_change(int(body.get("version_id")), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "changes":
                 return self._send(self.db.add_change(int(parts[2]), actor, body, role), 201)
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "guarantees":
+                return self._send(self.db.add_transfer_guarantee(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] in {"submit", "approve", "reject", "publish"}:
                 return self._send(self.db.transition(int(parts[2]), actor, role, parts[3]))
             raise DomainError("接口不存在", 404)
